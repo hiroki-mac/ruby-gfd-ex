@@ -140,7 +140,7 @@ gpna = NArray.to_na([vor.sp, div.sp, h.sp]) # GPhys変数をNArrayに格納
 
 i = 0
 while (dt*i < T) do
-#  while (i < 10) do
+#while (i < 10000) do
   if (i%10 == 0) then # check CFL condition
     psi = invlap(gpna[0]) # 流線関数
     chi = invlap(gpna[1]) # 速度ポテンシャル
@@ -151,6 +151,9 @@ while (dt*i < T) do
     auto_write(ofn[0], gpna[0].gp, i, false)
     auto_write(ofn[1], gpna[1].gp, i, false)
     auto_write(ofn[2], gpna[2].gp, i, false)
+    
+    binding.pry if File.exist?("stop")
+
   end
 
 #    gpna = TimeIntegration.rk3(gpna,dt,1,&voreq2Dplane)
@@ -161,4 +164,5 @@ while (dt*i < T) do
   if gpna[0].real.max.to_f.nan? then
     raise "!!! Numerical Instability occurs !!!"
   end
+    
 end
