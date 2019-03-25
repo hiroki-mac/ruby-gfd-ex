@@ -1,3 +1,4 @@
+# 2次元渦度方程式
 require "numru/gphys"
 require "numru/ganalysis"
 require "../../lib/timeintegration.rb"
