@@ -23,7 +23,7 @@ module GPMath
   @@use_spht = false
   @@output_in_spectral = false
   @@radius = GAnalysis::Planet.radius
-  @@boundary_condition = 2 # 1:linear 2:cyclic
+  @@boundary_condition = [2,2,2] # 1:linear 2:cyclic
   @@x = 0; @@y = 1; @@z = 2
   @@nmax = nil
   @@fft_wavenumber_x = nil
@@ -120,14 +120,19 @@ class GPhys
 
   def self.use_fft(bool=true); @@use_fft = bool; end
   def self.use_spht(bool=true); @@use_spht = bool; end
-  def self.linear_bc; @@boundary_condition = 1; end
-  def self.cyclic_bc; @@boundary_condition = 2; end
+  def self.linear_bc(dim=nil)
+    if dim == nil then @@boundary_condition = [1,1,1]
+    else @@boundary_condition[dim] = 1 end
+  end
+  def self.cyclic_bc(dim=nil)
+    if dim == nil then @@boundary_condition = [2,2,2]
+    else @@boundary_condition[dim] = 2 end
+  end
   def self.output_in_spectral(bool=true); @@output_in_spectral = bool; end
 
   def deriv(x) # 微分
     if @@use_spht then
       if (x == @@x) then # d/dlon
-#        binding.pry
 #        dgp = SphericalHarmonics.sh_dlon(self.gp)/@@radius
         smn = self.sp
         dgp = SphericalHarmonics.sp_dlon(smn)/@@radius # d/dlon * (1/radius)
@@ -144,10 +149,10 @@ class GPhys
       else
         return dgp.gp
       end
-    elsif @@use_fft then
+    elsif @@use_fft then  # TODO: 非周期境界のときでもFFTで計算可能にする
       self.fft_deriv(x)
     else
-      self.threepoint_O2nd_deriv(x,@@boundary_condition)
+      self.threepoint_O2nd_deriv(x,@@boundary_condition[x])
     end
   end
 
@@ -209,6 +214,11 @@ class GPhys
 
   # prepare wavenumber NArray used in deriv, lap, invlap operations.
   def self.prepare_fft_wavenumber(gp)
+    # 非周期境界なら鏡像拡張する
+    gp = gp.mirror_ext(@@x) if (@@boundary_condition[@@x] == 1)
+    gp = gp.mirror_ext(@@y) if (@@boundary_condition[@@y] == 1)
+    gp = gp.mirror_ext(@@z) if (@@boundary_condition[@@z] == 1)
+
     rank = gp.rank
     @@fft_wavenumber_x = gp.fft_wavenumber(@@x) if (gp.shape[@@x] > 1)
     if (rank > @@y) then
@@ -237,7 +247,11 @@ class GPhys
   # d: number of the dimension for derivative
   # n: 微分の階数
   def fft_deriv(d=0,n=1)
-    sp = self.fft(false,d)
+    gp = self.copy
+    gp = gp.mirror_ext(@@x) if (@@boundary_condition[@@x] == 1)
+    gp = gp.mirror_ext(@@y) if (@@boundary_condition[@@y] == 1)
+    gp = gp.mirror_ext(@@z) if (@@boundary_condition[@@z] == 1)
+    sp = gp.fft(false,d)
     case d
     when @@x;      kval = @@fft_wavenumber_x
     when @@y;      kval = @@fft_wavenumber_y
@@ -257,6 +271,11 @@ class GPhys
       long_name = name
     end
     gpout.set_att("long_name",long_name)            # set long_name
+    
+    gpout = gpout.cut_mirror_ext(@@x, self) if (@@boundary_condition[@@x] == 1)
+    gpout = gpout.cut_mirror_ext(@@y, self) if (@@boundary_condition[@@y] == 1)
+    gpout = gpout.cut_mirror_ext(@@z, self) if (@@boundary_condition[@@z] == 1)
+
     return gpout
   end
 
@@ -269,12 +288,23 @@ class GPhys
       gplap = gplap.gp unless @@output_in_spectral
 
     elsif (@@use_fft) then
-      sp = self.fft(false,@@x,@@y)
+      if (@@boundary_condition[@@x] == 2 && @@boundary_condition[@@y] == 2) then # 2重周期
+        m_ext = self
+      elsif (@@boundary_condition[@@x] == 1 && @@boundary_condition[@@y] == 1) then
+        m_ext = self.mirror_ext(@@x).mirror_ext(@@y) # x, y ともに非周期
+      elsif (@@boundary_condition[@@x] == 1) then
+        m_ext = self.mirror_ext(@@x) # xは非周期 y は周期
+      else
+        m_ext = self.mirror_ext(@@y) # xは周期 y は非周期
+      end
+      sp = m_ext.fft(false,@@x,@@y)
       sp = sp.mul!(@@fft_wavenumber_for_lap)
       gplap = sp.fft(true,@@x,@@y).real
       gplap.units = self.units/self.coord(0).units**2
+      gplap = gplap.cut_mirror_ext(@@x, self) if (@@boundary_condition[@@x] == 1)
+      gplap = gplap.cut_mirror_ext(@@y, self) if (@@boundary_condition[@@y] == 1)
     else
-      gplap = self.deriv2nd(@@x,@@boundary_condition) + self.deriv2nd(@@y,@@boundary_condition)
+      gplap = self.deriv2nd(@@x,@@boundary_condition[@@x]) + self.deriv2nd(@@y,@@boundary_condition[@@y])
     end
 
     gplap.rename("lap_"+name)
@@ -285,17 +315,43 @@ class GPhys
   # inverse of Laplacian on x-y plane
   def invlap
     name = self.name
-    if (@@use_spht) then
+    if (@@use_spht) then # 球面
       if (self.ntype == "complex") then
         gpout = SphericalHarmonics.sp_invlaplacian(self)*(@@radius*@@radius) # スペクトル→スペクトル
       else
         gpout = SphericalHarmonics.sh_invlaplacian(self)*(@@radius*@@radius) # グリッド→スペクトル→グリッド
       end
-    else
-      sp = self.fft(false,@@x,@@y)
+    elsif (@@use_fft) then
+      if (@@boundary_condition[@@x] == 2 && @@boundary_condition[@@y] == 2) then # 2重周期
+        m_ext = self
+      elsif (@@boundary_condition[@@x] == 1 && @@boundary_condition[@@y] == 1) then
+        m_ext = self.mirror_ext(@@x).mirror_ext(@@y) # x, y ともに非周期
+      elsif (@@boundary_condition[@@x] == 1) then
+        m_ext = self.mirror_ext(@@x) # xは非周期 y は周期
+      else
+        m_ext = self.mirror_ext(@@y) # xは周期 y は非周期
+      end
+      sp = m_ext.fft(false,@@x,@@y)
       sp = sp.mul!(@@fft_wavenumber_for_invlap)
-      gpout = sp.fft(true,@@x,@@y).real
+      gpout = -sp.fft(true,@@x,@@y).real
       gpout.units = self.units*self.coord(0).units**2
+      gpout = gpout.cut_mirror_ext(@@x, self) if (@@boundary_condition[@@x] == 1)
+      gpout = gpout.cut_mirror_ext(@@y, self) if (@@boundary_condition[@@y] == 1)
+    else # 差分法
+      # gpout = self.int2(@@x).int2(@@y) これは間違い
+      # SOR法 境界値が固定になるので注意（周期境界には非対応）
+      require "numru/ganalysis/pde"
+      gpout = self.copy
+      f = self.val.reshape(self.shape[0], self.shape[1])
+      z = f.clone
+      a = z*0.0 + 1.0
+      b = z*0.0
+      dx = self.coord(@@x).val[1] - self.coord(@@x).val[0]
+      dy = self.coord(@@y).val[1] - self.coord(@@y).val[0]
+      res = 0.0
+      GAnalysis::PDE.SOR_2D_2ndorder(z,a,b,a,b,b,f,dx,dy,1.9,eps:1E-8)
+      gpout.replace_val(z.reshape(*(self.shape)))
+      gpout.units = self.units*self.coord(@@x).units*self.coord(@@y).units
     end
     gpout.rename("invlap_"+name)
     gpout.set_att("long_name","invlap_"+name)
@@ -337,43 +393,56 @@ class GPhys
       "units" => "1",
       "name" => "x",
       "long_name" => "x-axis",
-      "cyclic" => true
+      "cyclic" => true,
+      "virtual_points" => 0,
+      "cell_center" => true
     }
     default_opts.each_key{|key|
-      opts[key] = default_opts[key] unless opts[key]
+      opts[key] = default_opts[key] if opts[key].nil?
     }
     st = opts["range"].begin; ed = opts["range"].end
     n = opts["grid_points"]
+    vn = opts["virtual_points"]
     if (opts["cyclic"] or n == 1) then
       dx = (ed - st).to_f/n
     else
       dx = (ed - st).to_f/(n-1)
     end
+    if (na) then
+      x_na = na
+    else
+      if (opts["cyclic"]) then
+        x_na = NArray.float(n+vn*2).indgen!*dx + st - vn*dx
+      elsif (opts["cell_center"]) then
+        x_na = NArray.float(n+vn*2).indgen!*dx + st - vn*dx + dx*0.5
+      else # cell boundary
+        x_na = NArray.float(n+vn*2).indgen!*dx + st - vn*dx
+      end
+    end
+
     opts.each_key{|key|
       unless ([String, Array, NArray].include?(opts[key].class)) then
         opts[key] = opts[key].to_s
       end
     }
-    if (na) then
-      x_na = na
-    else
-      x_na = NArray.float(n).indgen!*dx + st
-    end
     x_va = VArray.new(x_na, opts, opts["name"])
     return Axis.new.set_pos(x_va)
   end
 
   def self.domain1D(opts={})
+    @@boundary_condition[@@x] = 1 if (xopts["cyclic"] == false)
     xaxis = GPhys.makeAxis(opts)
     taxis = GPhys.makeAxis({"range"=>0..0, "grid_points"=> 1, "name"=>"t", "units"=>"s", "long_name"=>"time", "cyclic"=>false})
     return Grid.new(xaxis,taxis)
   end
 
   def self.domain2D(xopts={},yopts={})
+    @@boundary_condition[@@x] = 1 if (xopts["cyclic"] == false)
+    @@boundary_condition[@@y] = 1 if (yopts["cyclic"] == false)
     xaxis = GPhys.makeAxis(xopts)
     default_yopts = {"name" => "y", "long_name" => "y-axis"}
     default_yopts.each_key{|key|
-      yopts[key] = default_yopts[key] unless yopts[key]
+      yopts[key] = default_yopts[key] if yopts[key].nil?
     }
     yaxis = GPhys.makeAxis(yopts)
     taxis = GPhys.makeAxis({"range"=>0..0, "grid_points"=> 1, "name"=>"t", "units"=>"s", "long_name"=>"time", "cyclic"=>false})
@@ -381,15 +450,18 @@ class GPhys
   end
 
   def self.domain3D(xopts={},yopts={},zopts={})
+    @@boundary_condition[@@x] = 1 if (xopts["cyclic"] == false)
+    @@boundary_condition[@@y] = 1 if (yopts["cyclic"] == false)
+    @@boundary_condition[@@z] = 1 if (zopts["cyclic"] == false)
     xaxis = GPhys.makeAxis(xopts)
     default_yopts = {"name" => "y", "long_name" => "y-axis"}
     default_yopts.each_key{|key|
-      yopts[key] = default_yopts[key] unless yopts[key]
+      yopts[key] = default_yopts[key] if yopts[key].nil?
     }
     yaxis = GPhys.makeAxis(yopts)
     default_zopts = {"name" => "z", "long_name" => "z-axis"}
     default_zopts.each_key{|key|
-      zopts[key] = default_zopts[key] unless zopts[key]
+      zopts[key] = default_zopts[key] if zopts[key].nil?
     }
     zaxis = GPhys.makeAxis(zopts)
     taxis = GPhys.makeAxis({"range"=>0..0, "grid_points"=> 1, "name"=>"t", "units"=>"s", "long_name"=>"time", "cyclic"=>false})
@@ -416,9 +488,10 @@ class GPhys
     gauss_lat = SphericalHarmonics.mu2deg(mu)
     yaxis = GPhys.makeAxis({"range"=>-90..90, "grid_points"=>imax/2, "name"=>"lat", "units"=>"deg", "long_name"=>"latitude", "cyclic"=>false}, gauss_lat)
 
+    @@boundary_condition[@@z] = 1
     default_zopts = {"name" => "z", "long_name" => "height"}
     default_zopts.each_key{|key|
-      zopts[key] = default_zopts[key] unless zopts[key]
+      zopts[key] = default_zopts[key] if zopts[key].nil?
     }
     zaxis = GPhys.makeAxis(zopts)
     taxis = GPhys.makeAxis({"range"=>0..0, "grid_points"=> 1, "name"=>"t", "units"=>"s", "long_name"=>"time", "cyclic"=>false})
@@ -438,17 +511,146 @@ class GPhys
       "long_name" => "var_name"
     }
     default_opts.each_key{|key|
-      opts[key] = default_opts[key] unless opts[key]
+      opts[key] = default_opts[key] if opts[key].nil?
     }
     na = NArray.float(*grid.shape)
     va = VArray.new(na, opts, opts["name"])
     return GPhys.new(grid,va)
   end
 
+  def mirror_ext(dim) # GPhys オブジェクトの 鏡像拡張 (正負反転)
+    mirror = self.copy
+    mirror.axis(dim).set_pos(-mirror.coord(dim)) # 軸の正負反転
+    mirror.coord(dim).replace_val(mirror.coord(dim).val.reverse) # 軸の値(順序)を反転
+    mirror.replace_val(-mirror.val.reverse(dim)) # 変数の値を軸に当該沿って反転し、正負も反転させる
+    if (mirror.coord(dim).val[-1] == self.coord(dim).val[0]) # 0の重複を除く
+      tmp = mirror.cut_rank_conserving({self.axis(dim).name=>mirror.coord(dim).val[0]})
+      dx = self.coord(dim)[1].val - self.coord(dim)[0].val
+      tmp.coord(dim).replace_val(tmp.coord(dim).val - dx)
+      tmp.replace_val(tmp.val*0.0)
+      return GPhys.join([tmp, mirror[true,0..-2,false], self])
+    else
+      return GPhys.join([mirror, self])
+    end
+  end
+  
+  def cut_mirror_ext(dim, gp_org) # 鏡像拡張した部分をカットする。gp_org は元々のGPhysオブジェクト
+    return self.cut({gp_org.axis(dim).name => self.coord(dim).val[-gp_org.shape[dim]]..self.coord(dim).val[-1]})
+  end
 
+  def int(dim, bnd_v=nil)
 
+    gp = self.copy
+    axis = self.coord(dim).val; im = axis.length
+    flag_mean = false
+    if (bnd_v == nil) then; bnd_v = 0.0; flag_mean = true; end
+    
+    case dim
+    when 0
+      gp[0,false] = gp[0,false]*0.0 + bnd_v # 下端の値
+      gp[1,false] = gp[0,false] + (axis[1]-axis[0])*self[0,false]
+      for i in 1..(im-2)
+        gp[i+1,false] = gp[i-1,false] + (axis[i+1]-axis[i-1])*self[i,false]
+      end
+    when 1
+      gp[true,0,false] = gp[true,0,false]*0.0 + bnd_v # 下端の値
+      gp[true,1,false] = gp[true,0,false] + (axis[1]-axis[0])*self[true,0,false]
+      for i in 1..(im-2)
+        gp[true,i+1,false] = gp[true,i-1,false] + (axis[i+1]-axis[i-1])*self[true,i,false]
+      end
+    when 2
+      gp[true,true,0,false] = gp[true,true,0,false]*0.0 + bnd_v # 下端の値
+      gp[true,true,1,false] = gp[true,true,0,false] + (axis[1]-axis[0])*self[true,true,0,false]
+      for i in 1..(im-2)
+        gp[true,true,i+1,false] = gp[true,true,i-1,false] + (axis[i+1]-axis[i-1])*self[true,true,i,false]
+      end
+    else; raise "not supported."
+    end
+    gp.units=(gp.units * gp.coord(dim).units)
+    gp = gp.eddy(dim) if flag_mean
+    return gp
+  
+  end
 
+  def intO2(dim, bnd_v=nil)
+    gp = self.copy
+    axis = self.coord(dim).val; im = axis.length
+    flag_mean = false
+    if (bnd_v == nil) then; bnd_v = 0.0; flag_mean = true; end
+    case dim
+    when 0
+      gp[0,false] = gp[0,false]*0.0 + bnd_v # 下端の値
+      gp[1,false] = (axis[1]-axis[0])*self[0,false]
+      for i in 1..(im-2)
+        # t = x_{i+1} - x_{i}, s = x_{i} - x_{i-1}
+        tbs = (axis[i+1]-axis[i])/(axis[i]-axis[i-1]) # t/s
+        spt = axis[i+1] - axis[i-1] # s + t
+        gp[i+1,false] = (1.0-tbs*tbs)*gp[i,false] + (tbs*tbs)*gp[i-1,false] + (tbs*spt)*self[i,false]
+      end
+    when 1
+    when 2
+    else; raise "not supported."
+    end
+    gp.units=(gp.units * gp.coord(dim).units)
+    gp = gp.eddy(dim) if flag_mean
+    return gp
+  end
 
+  # 2階積分
+  def int2(dim, sb=nil, eb=nil) # sbnd 始点境界の値、 ebnd 終点境界の値
+    gp = self.copy
+    axis = self.coord(dim).val; im = axis.length; flag_mean = false
+    if (sb == nil) then; sb = 0.0; flag_mean = true; end
+    case @@boundary_condition[dim]
+    when 1 # 非周期境界条件
+      eb = sb if (eb == nil)
+    when 2 # 周期境界条件
+      eb = sb
+    end
+    
+    case dim
+    when 0
+      gp[0,false] = gp[0,false]*0.0 + sb # 下端の値
+      gp[1,false] = gp[0,false] + 0.5*(axis[1]-axis[0])*(axis[1]-axis[0])*self[0,false] # gp_(-1) = gp_1 を仮定
+      for i in 1..(im-2)
+        # t = x_{i+1} - x_{i}, s = x_{i} - x_{i-1}
+        tbs = (axis[i+1]-axis[i])/(axis[i]-axis[i-1]) # t/s
+        sptt = (axis[i+1] - axis[i-1])*(axis[i+1]-axis[i])*0.5 # (s + t)*t/2
+        gp[i+1,false] = (1.0+tbs)*gp[i,false] - (tbs)*gp[i-1,false] + (sptt)*self[i,false]
+      end
+      for i in 0..(im-1) # 積分定数の C*x 分の調整
+        gp[i,false] = gp[i,false] - (gp[im-1,false] - gp[0,false] - eb)*(axis[i]-axis[0])/(axis[im-1]-axis[0])
+      end
+    when 1
+      gp[true,0,false] = gp[true,0,false]*0.0 + sb # 下端の値
+      gp[true,1,false] = gp[true,0,false] + 0.5*(axis[1]-axis[0])*(axis[1]-axis[0])*self[true,0,false] # gp_(-1) = gp_1 を仮定
+      for i in 1..(im-2)
+        # t = x_{i+1} - x_{i}, s = x_{i} - x_{i-1}
+        tbs = (axis[i+1]-axis[i])/(axis[i]-axis[i-1]) # t/s
+        sptt = (axis[i+1] - axis[i-1])*(axis[i+1]-axis[i])*0.5 # (s + t)*t/2
+        gp[true,i+1,false] = (1.0+tbs)*gp[true,i,false] - (tbs)*gp[true,i-1,false] + (sptt)*self[true,i,false]
+      end
+      for i in 0..(im-1) # 積分定数の C*x 分の調整
+        gp[true,i,false] = gp[true,i,false] - (gp[true,im-1,false] - gp[true,0,false] - eb)*(axis[i]-axis[0])/(axis[im-1]-axis[0])
+      end
+    when 2
+      gp[true,true,0,false] = gp[true,true,0,false]*0.0 + sb # 下端の値
+      gp[true,true,1,false] = gp[true,true,0,false] + 0.5*(axis[1]-axis[0])*(axis[1]-axis[0])*self[true,true,0,false] # gp_(-1) = gp_1 を仮定
+      for i in 1..(im-2)
+        # t = x_{i+1} - x_{i}, s = x_{i} - x_{i-1}
+        tbs = (axis[i+1]-axis[i])/(axis[i]-axis[i-1]) # t/s
+        sptt = (axis[i+1] - axis[i-1])*(axis[i+1]-axis[i])*0.5 # (s + t)*t/2
+        gp[true,true,i+1,false] = (1.0+tbs)*gp[true,true,i,false] - (tbs)*gp[true,true,i-1,false] + (sptt)*self[true,true,i,false]
+      end
+      for i in 0..(im-1) # 積分定数の C*x 分の調整
+        gp[true,true,i,false] = gp[true,true,i,false] - (gp[true,true,im-1,false] - gp[true,true,0,false] - eb)*(axis[i]-axis[0])/(axis[im-1]-axis[0])
+      end
+    else; raise "not supported."
+    end
+    gp.units=(gp.units * gp.coord(dim).units * gp.coord(dim).units )
+    gp = gp.eddy(dim) if flag_mean
+    return gp
+  end
 
 
 
